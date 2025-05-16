@@ -158,7 +158,7 @@ pub(crate) fn function_is_too_complex(
     body: &[Stmt],
     max_complexity: usize,
 ) -> Option<Diagnostic> {
-    let complexity = get_complexity_number(body) + 1;
+    let complexity = get_complexity_number(body);
     if complexity > max_complexity {
         Some(Diagnostic::new(
             ComplexStructure {
