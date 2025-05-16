@@ -1,8 +1,7 @@
-use ruff_python_ast::{self as ast, ExceptHandler, Stmt};
+use ruff_python_ast::{self as ast, ExceptHandler, Stmt, Expr};
 
 use ruff_diagnostics::{Diagnostic, Violation};
 use ruff_macros::{derive_message_formats, ViolationMetadata};
-use ruff_python_ast::identifier::Identifier;
 use ruff_text_size::Ranged;
 
 /// ## What it does
@@ -65,45 +64,90 @@ impl Violation for ComplexStructure {
     }
 }
 
+/// Get the complexity contribution from a logical expression by counting transitions
+/// between different boolean operators (and/or).
+fn get_expression_complexity(expr: &Expr) -> usize {
+    use ruff_python_ast::BoolOp;
+    
+    fn count_bool_op_sequences(expr: &Expr, current_op_kind: Option<&BoolOp>, mut count: usize) -> usize {
+        if let Expr::BoolOp(ast::ExprBoolOp { op, values, .. }) = expr {
+            // If this is a different operator than the current one, increment count
+            if current_op_kind.is_none() || core::mem::discriminant(current_op_kind.unwrap()) != core::mem::discriminant(op) {
+                count += 1;
+            }
+            
+            // Recursively check values with the current operator kind
+            for value in values {
+                count = count_bool_op_sequences(value, Some(op), count);
+            }
+        }
+        
+        count
+    }
+    
+    count_bool_op_sequences(expr, None, 0)
+}
+
 fn get_complexity_number(stmts: &[Stmt]) -> usize {
     let mut complexity = 0;
     for stmt in stmts {
         match stmt {
             Stmt::If(ast::StmtIf {
+                test,
                 body,
                 elif_else_clauses,
                 ..
             }) => {
                 complexity += 1;
+                complexity += get_expression_complexity(test);
                 complexity += get_complexity_number(body);
+                
                 for clause in elif_else_clauses {
-                    if clause.test.is_some() {
-                        complexity += 1;
+                    complexity += 1;
+                    
+                    if let Some(test) = &clause.test {
+                        complexity += get_expression_complexity(test);
                     }
+                    
                     complexity += get_complexity_number(&clause.body);
                 }
             }
             Stmt::For(ast::StmtFor { body, orelse, .. }) => {
                 complexity += 1;
                 complexity += get_complexity_number(body);
+
+                if !orelse.is_empty() {
+                    complexity += 1;
+                }
+
                 complexity += get_complexity_number(orelse);
             }
             Stmt::With(ast::StmtWith { body, .. }) => {
                 complexity += get_complexity_number(body);
             }
-            Stmt::While(ast::StmtWhile { body, orelse, .. }) => {
+            Stmt::While(ast::StmtWhile { test, body, orelse, .. }) => {
                 complexity += 1;
+                complexity += get_expression_complexity(test);
                 complexity += get_complexity_number(body);
+
+                if !orelse.is_empty() {
+                    complexity += 1;
+                }
+
                 complexity += get_complexity_number(orelse);
             }
             Stmt::Match(ast::StmtMatch { cases, .. }) => {
-                // Add 1 for the match statement itself
                 complexity += 1;
                 
                 for case in cases {
                     if case.pattern.is_irrefutable() {
                         complexity += 1;
                     }
+                    
+                    if let Some(guard) = &case.guard {
+                        complexity += get_expression_complexity(guard);
+                    }
+                    
                     complexity += get_complexity_number(&case.body);
                 }
             }
@@ -115,13 +159,20 @@ fn get_complexity_number(stmts: &[Stmt]) -> usize {
                 ..
             }) => {
                 complexity += get_complexity_number(body);
+                
+                if !handlers.is_empty() {
+                    complexity += 1;
+                }
+                
                 if !orelse.is_empty() {
                     complexity += 1;
                 }
+                
+                // Process the bodies of all handlers and clauses
                 complexity += get_complexity_number(orelse);
                 complexity += get_complexity_number(finalbody);
+                
                 for handler in handlers {
-                    complexity += 1;
                     let ExceptHandler::ExceptHandler(ast::ExceptHandlerExceptHandler {
                         body, ..
                     }) = handler;
@@ -213,33 +264,33 @@ def sequential(n):
     #[test]
     fn if_elif_else_dead_path() -> Result<()> {
         let source = r#"
-def if_elif_else_dead_path(n):
-    if n > 3:
-        return "bigger than three"
-    elif n > 4:
+def if_elif_else_dead_path(n):      # +1
+    if n > 3:                       # +1
+        return "bigger than three" 
+    elif n > 4:                     # +1
         return "is never executed"
-    else:
+    else:                           # +1
         return "smaller than or equal to three"
 "#;
         let stmts = parse_suite(source)?;
-        assert_eq!(get_complexity_number(&stmts), 3);
+        assert_eq!(get_complexity_number(&stmts), 4);
         Ok(())
     }
 
     #[test]
     fn nested_ifs() -> Result<()> {
         let source = r#"
-def nested_ifs():
-    if n > 3:
-        if n > 4:
+def nested_ifs():                               # +1
+    if n > 3:                                   # +1
+        if n > 4:                               # +1
             return "bigger than four"
-        else:
+        else:                                   # +1
             return "bigger than three"
-    else:
+    else:                                       # +1
         return "smaller than or equal to three"
 "#;
         let stmts = parse_suite(source)?;
-        assert_eq!(get_complexity_number(&stmts), 3);
+        assert_eq!(get_complexity_number(&stmts), 5);
         Ok(())
     }
 
@@ -258,28 +309,28 @@ def for_loop():
     #[test]
     fn for_else() -> Result<()> {
         let source = r"
-def for_else(mylist):
-    for i in mylist:
+def for_else(mylist): # +1
+    for i in mylist:  # +1
         print(i)
-    else:
+    else:             # +1
         print(None)
 ";
         let stmts = parse_suite(source)?;
-        assert_eq!(get_complexity_number(&stmts), 2);
+        assert_eq!(get_complexity_number(&stmts), 3);
         Ok(())
     }
 
     #[test]
     fn recursive() -> Result<()> {
         let source = r"
-def recursive(n):
-    if n > 4:
+def recursive(n):       # +1
+    if n > 4:           # +1
         return f(n - 1)
-    else:
+    else:               # +1
         return n
 ";
         let stmts = parse_suite(source)?;
-        assert_eq!(get_complexity_number(&stmts), 2);
+        assert_eq!(get_complexity_number(&stmts), 3);
         Ok(())
     }
 
@@ -297,24 +348,6 @@ def nested_functions():
 ";
         let stmts = parse_suite(source)?;
         assert_eq!(get_complexity_number(&stmts), 3);
-        Ok(())
-    }
-
-    #[test]
-    fn try_else() -> Result<()> {
-        let source = r"
-def try_else():
-    try:
-        print(1)
-    except TypeA:
-        print(2)
-    except TypeB:
-        print(3)
-    else:
-        print(4)
-";
-        let stmts = parse_suite(source)?;
-        assert_eq!(get_complexity_number(&stmts), 4);
         Ok(())
     }
 
@@ -499,6 +532,105 @@ def f():
             print('hello')
         case 5 | _:
             print(x)
+";
+        let stmts = parse_suite(source)?;
+        assert_eq!(get_complexity_number(&stmts), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn counts_multiple_same_logical_expression_sequences_as_one() -> Result<()> {
+        let source = r"
+class C:
+    def M(self, a, b, c):
+        if a and b and c:  # +1 for if; +1 for all and
+            # no-op
+            pass
+";
+        let stmts = parse_suite(source)?;
+        assert_eq!(get_complexity_number(&stmts), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn counts_multiple_mixed_logical_expression_sequences_separately() -> Result<()> {
+        let source = r"
+class C:
+    def M(self, a, b, c, d, e):
+        if (a and b and c) or d or e:  # +1 for if; +1 for all and; +1 for all or
+            # no-op
+            pass
+";
+        let stmts = parse_suite(source)?;
+        assert_eq!(get_complexity_number(&stmts), 4);
+        Ok(())
+    }    
+
+    #[test]
+    fn counts_for_each_new_logical_expression_sequence_even_if_it_was_used_before() -> Result<()> {
+        let source = r"
+class C:
+    def M(self, a, b, c, d):
+        if (a and b) or (c and d):   #  +1 for if; +1 for and; +1 for or; +1 for and (new)
+            # no-op
+            pass
+";
+        let stmts = parse_suite(source)?;
+        assert_eq!(get_complexity_number(&stmts), 5);
+        Ok(())
+    }
+
+    #[test]
+    fn while_with_logical_expression() -> Result<()> {
+        let source = r"
+def test_while():
+    while a and b:  # +1 for while, +1 for and
+        pass
+";
+        let stmts = parse_suite(source)?;
+        assert_eq!(get_complexity_number(&stmts), 3);
+        Ok(())
+    } 
+
+    #[test]
+    fn match_with_guard_logical_expression() -> Result<()> {
+        let source = r"
+def test_match(value):
+    match value:
+        case 1 if (a and b) or c:  # +1 for match, +1 for case, +1 for and, +1 for or
+            pass
+";
+        let stmts = parse_suite(source)?;
+        assert_eq!(get_complexity_number(&stmts), 4);
+        Ok(())
+    }
+
+    #[test]
+    fn else_in_while() -> Result<()> {
+        let source = r"
+def while_else(condition): # +1
+    while condition:       # +1
+        print('in while')
+    else:                  # +1
+        print('in else')
+";
+        let stmts = parse_suite(source)?;
+        assert_eq!(get_complexity_number(&stmts), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn else_in_try() -> Result<()> {
+        let source = r"
+def try_else():   # +1
+    try:
+        print(1)
+    except TypeA: # +1
+        print(2)
+    except TypeB: # 0
+        print(3)
+    else:         # +1
+        print(4)
 ";
         let stmts = parse_suite(source)?;
         assert_eq!(get_complexity_number(&stmts), 3);
