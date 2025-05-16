@@ -3,6 +3,7 @@ use ruff_python_ast::{self as ast, ExceptHandler, Stmt};
 use ruff_diagnostics::{Diagnostic, Violation};
 use ruff_macros::{derive_message_formats, ViolationMetadata};
 use ruff_python_ast::identifier::Identifier;
+use ruff_text_size::Ranged;
 
 /// ## What it does
 /// Checks for functions with a high `McCabe` complexity.
@@ -96,26 +97,14 @@ fn get_complexity_number(stmts: &[Stmt]) -> usize {
                 complexity += get_complexity_number(orelse);
             }
             Stmt::Match(ast::StmtMatch { cases, .. }) => {
+                // Add 1 for the match statement itself
+                complexity += 1;
+                
                 for case in cases {
-                    complexity += 1;
-                    complexity += get_complexity_number(&case.body);
-                }
-                if let Some(last_case) = cases.last() {
-                    // The complexity of an irrefutable pattern is similar to an `else` block of an `if` statement.
-                    //
-                    // For example:
-                    // ```python
-                    // match subject:
-                    //     case 1: ...
-                    //     case _: ...
-                    //
-                    // match subject:
-                    //     case 1: ...
-                    //     case foo: ...
-                    // ```
-                    if last_case.guard.is_none() && last_case.pattern.is_irrefutable() {
-                        complexity -= 1;
+                    if case.pattern.is_irrefutable() {
+                        complexity += 1;
                     }
+                    complexity += get_complexity_number(&case.body);
                 }
             }
             Stmt::Try(ast::StmtTry {
@@ -166,7 +155,7 @@ pub(crate) fn function_is_too_complex(
                 complexity,
                 max_complexity,
             },
-            stmt.identifier(),
+            stmt.range(),
         ))
     } else {
         None
@@ -463,7 +452,7 @@ def f():
             print('bar')
 ";
         let stmts = parse_suite(source)?;
-        assert_eq!(get_complexity_number(&stmts), 2);
+        assert_eq!(get_complexity_number(&stmts), 3);
         Ok(())
     }
 
@@ -474,8 +463,10 @@ def f():
     match subject:
         case 2:
             print('foo')
-        case 2:
+        case 3:
             print('bar')
+        case 4:
+            print('bar')            
         case _:
             print('baz')
 ";
@@ -495,12 +486,12 @@ def f():
             print(x)
 ";
         let stmts = parse_suite(source)?;
-        assert_eq!(get_complexity_number(&stmts), 2);
+        assert_eq!(get_complexity_number(&stmts), 3);
         Ok(())
     }
 
     #[test]
-    fn match_case_catch_all_with_seuqnece() -> Result<()> {
+    fn match_case_catch_all_with_sequence() -> Result<()> {
         let source = r"
 def f():
     match subject:
@@ -510,7 +501,7 @@ def f():
             print(x)
 ";
         let stmts = parse_suite(source)?;
-        assert_eq!(get_complexity_number(&stmts), 2);
+        assert_eq!(get_complexity_number(&stmts), 3);
         Ok(())
     }
 }
